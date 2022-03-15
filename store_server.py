@@ -8,13 +8,40 @@ from argparse import ArgumentParser
 
 app = Flask(__name__)
 
+# Сервер на Flask с использованием дополнительного треда для отложенных операций отмены бронирования (asyncio, Thread)
 
+# Имеется 2 таблицы в формате SQLite: items (хранит предметы на складе), bookings (хранит бронирования)
+# Схема таблиц описана в schema.sql
+
+# Концепция работы следующая:
+
+# Клиент отправляет запрос /items_by_string?query=S
+# Из items возвращаются все элементы с названием, содержащим S как подстроку
+
+# Клиент отправляет запрос бронирования /booking конкретного предмета id в количестве quantity
+# Если такое количество доступно для бронирования, то возвращается уникальный номер бронирования,
+# а это количество бронируется для покупателя
+
+# В течение суток клиент должен подтвердить бронирование /confirm_booking (если он нашел доставщика),
+# либо отменить его /cancel_booking.
+# Если клиент не подтвердит бронирование в течение суток,
+# то происходит автоматическая отмена бронирования (для этого используется отдельный поток).
+
+# При отмене бронирования забронированное количество снова становится доступно для бронирования, бронирование удаляется.
+# При подтверждении бронирования ставится соответствующий флаг в таблице bookings,
+# при фактическом получении груза ответственный работник на складе должен это бронирование пометить как выполненное.
+
+# Операции к БД выполняются атомарно, если это возможно.
+
+
+# получить доступ
 def get_db_connection():
     conn = sqlite3.connect('store.db', check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+# операция отмены бронирования в БД
 def cancel_booking(booking_id):
     con = get_db_connection()
     # increase amount back to what it was before (if booking still exists)
@@ -34,6 +61,7 @@ def cancel_booking(booking_id):
     return w
 
 
+# отложенная операция отмены бронирования
 async def check_booking(booking_id):
     # change to 60 * 60 * 24 for 1 day delay
     await asyncio.sleep(600)
@@ -41,6 +69,7 @@ async def check_booking(booking_id):
     return w
 
 
+# получить предметы с подходящим названием
 @app.route('/items_by_string', methods=['GET'])
 def get_everything():
     substring = None
@@ -50,6 +79,7 @@ def get_everything():
         pass
     if substring is None:
         substring = ''
+    # оставляем только буквы и цифры для защиты от SQL инъекций
     substring = re.sub('[^a-zA-Z А-Яа-я0-9]+', '', substring)
     con = get_db_connection()
     res = con.execute("SELECT * FROM items WHERE name LIKE '%' || ? || '%'", (substring, )).fetchall()
@@ -59,6 +89,7 @@ def get_everything():
     return jsonify([{x: str(w[x]) if x == 'id' else w[x] for x in w.keys()} for w in res])
 
 
+# создать бронирование
 @app.route('/booking', methods=['POST'])
 def make_booking():
     item_id = 0
@@ -86,6 +117,7 @@ def make_booking():
     return {'id': str(booking_id), 'address': res['coordinates'], 'available_date': date}
 
 
+# отменить бронирование
 @app.route('/cancel_booking', methods=['POST'])
 def cancel():
     booking_id = -1
@@ -101,6 +133,7 @@ def cancel():
         abort(400, "This booking cannot be canceled")
 
 
+# подтвердить бронирование
 @app.route('/confirm_booking', methods=['POST'])
 def confirm_booking():
     booking_id = -1
@@ -120,6 +153,7 @@ def confirm_booking():
         abort(400, "This booking cannot be confirmed")
 
 
+# запустить тред
 def start_background_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
@@ -130,6 +164,7 @@ if __name__ == '__main__':
     parser.add_argument('-init', help='initialize database', action='store_true')
     args = parser.parse_args()
     if args.init:
+        # создать тестовую БД
         print('initializing database from schema.sql')
         con = get_db_connection()
         with open('schema.sql') as f:
@@ -144,8 +179,10 @@ if __name__ == '__main__':
         con.commit()
         con.close()
 
+    # создать и запустить тред
     loop = asyncio.new_event_loop()
     t = Thread(target=start_background_loop, args=(loop,), daemon=True)
     t.start()
 
+    # запустить сервер
     app.run()
